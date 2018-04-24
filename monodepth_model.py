@@ -20,6 +20,7 @@ import tensorflow as tf
 import tensorflow.contrib.slim as slim
 
 from bilinear_sampler import *
+from bilinear_warp_sampler import *
 
 monodepth_parameters = namedtuple('parameters', 
                         'encoder, '
@@ -43,6 +44,7 @@ class MonodepthModel(object):
         self.mode = mode
         self.left = left
         self.right = right
+        self.method = 'dispbased'
         self.model_collection = ['model_' + str(model_index)]
 
         self.reuse_variables = reuse_variables
@@ -81,6 +83,16 @@ class MonodepthModel(object):
             nw = w // ratio
             scaled_imgs.append(tf.image.resize_area(img, [nh, nw]))
         return scaled_imgs
+
+
+    # def bilinear_warp_sampler(extrinsic, img, depth):
+    #     return warpped_img
+
+    def generate_image_left_warp(self,img,depth):
+        return bilinear_warp_depth_sampler(self.r2l, self.intrinsics, img, depth)
+
+    def generate_image_right_warp(self,img,depth):
+        return bilinear_warp_depth_sampler(self.l2r, self.intrinsics, img, depth)
 
     def generate_image_left(self, img, disp):
         return bilinear_sampler_1d_h(img, -disp)
@@ -307,29 +319,56 @@ class MonodepthModel(object):
                     return None
 
     def build_outputs(self):
+
+        if self.method == 'dispbased':
         # STORE DISPARITIES
-        with tf.variable_scope('disparities'):
-            self.disp_est  = [self.disp1, self.disp2, self.disp3, self.disp4]
-            self.disp_left_est  = [tf.expand_dims(d[:,:,:,0], 3) for d in self.disp_est]
-            self.disp_right_est = [tf.expand_dims(d[:,:,:,1], 3) for d in self.disp_est]
+            with tf.variable_scope('disparities'):
+                self.disp_est  = [self.disp1, self.disp2, self.disp3, self.disp4]
+                self.disp_left_est  = [tf.expand_dims(d[:,:,:,0], 3) for d in self.disp_est]
+                self.disp_right_est = [tf.expand_dims(d[:,:,:,1], 3) for d in self.disp_est]
 
-        if self.mode == 'test':
-            return
+            if self.mode == 'test':
+                return
 
-        # GENERATE IMAGES
-        with tf.variable_scope('images'):
-            self.left_est  = [self.generate_image_left(self.right_pyramid[i], self.disp_left_est[i])  for i in range(4)]
-            self.right_est = [self.generate_image_right(self.left_pyramid[i], self.disp_right_est[i]) for i in range(4)]
+            # GENERATE IMAGES
+            with tf.variable_scope('images'):
+                self.left_est  = [self.generate_image_left(self.right_pyramid[i], self.disp_left_est[i])  for i in range(4)]
+                self.right_est = [self.generate_image_right(self.left_pyramid[i], self.disp_right_est[i]) for i in range(4)]
 
-        # LR CONSISTENCY
-        with tf.variable_scope('left-right'):
-            self.right_to_left_disp = [self.generate_image_left(self.disp_right_est[i], self.disp_left_est[i])  for i in range(4)]
-            self.left_to_right_disp = [self.generate_image_right(self.disp_left_est[i], self.disp_right_est[i]) for i in range(4)]
+            # LR CONSISTENCY
+            with tf.variable_scope('left-right'):
+                self.right_to_left_disp = [self.generate_image_left(self.disp_right_est[i], self.disp_left_est[i])  for i in range(4)]
+                self.left_to_right_disp = [self.generate_image_right(self.disp_left_est[i], self.disp_right_est[i]) for i in range(4)]
 
-        # DISPARITY SMOOTHNESS
-        with tf.variable_scope('smoothness'):
-            self.disp_left_smoothness  = self.get_disparity_smoothness(self.disp_left_est,  self.left_pyramid)
-            self.disp_right_smoothness = self.get_disparity_smoothness(self.disp_right_est, self.right_pyramid)
+            # DISPARITY SMOOTHNESS
+            with tf.variable_scope('smoothness'):
+                self.disp_left_smoothness  = self.get_disparity_smoothness(self.disp_left_est,  self.left_pyramid)
+                self.disp_right_smoothness = self.get_disparity_smoothness(self.disp_right_est, self.right_pyramid)
+        else:
+            # STORE DEPTH, but not sure if we still need to keep both estimation
+            with tf.variable_scope('depth'):
+                self.depth_est = [self.disp1, self.disp2, self.disp3, self.disp4]
+                self.depth_left_est = [tf.expand_dims(d[:, :, :, 0], 3) for d in self.disp_est]
+                self.depth_right_est = [tf.expand_dims(d[:, :, :, 1], 3) for d in self.disp_est]
+
+            if self.mode == 'test':
+                return
+            # GENERATE IMAGES(DEPTH WARPPING)
+            with tf.variable_scope('warp-images'):
+                self.left_est_warp = [self.generate_image_left_warp(self.right_pyramid[i], self.depth_left_est[i]) for i in range(4)]
+                self.left_est_warp = [self.generate_image_right_warp(self.left_pyramid[i], self.depth_right_est[i]) for i in range(4)]
+
+            # LR CONSISTENCY FOR DEPTH
+            with tf.variable_scope('left-right'):
+                self.right_to_left_depth = [self.generate_image_left(self.depth_right_est[i], self.depth_left_est[i])  for i in range(4)]
+                self.left_to_right_depth = [self.generate_image_right(self.depth_left_est[i], self.depth_right_est[i]) for i in range(4)]
+
+            # DEPTH_SMOOTHNESS
+            with tf.variable_scope('depth_smoothness'):
+                self.depth_left_smoothness = self.get_depth_smoothness(self.depth_left_est,self.left_pyramid)
+                self.depth_right_smoothness = self.get_depth_smoothness(self.depth_right_est, self.right_pyramid)
+
+
 
     def build_losses(self):
         with tf.variable_scope('losses', reuse=self.reuse_variables):
